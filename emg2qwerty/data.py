@@ -542,8 +542,8 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
             "target_lengths": target_lengths,
         }
 
-
-class NegativeLatencyWindowedEMGDataset(WindowedEMGDataset):
+@dataclass
+class NegativeLatencyWindowedEMGDataset(torch.utils.data.Dataset):
     """A `WindowedEMGDataset` that shifts target labels forward in time.
 
     This enables "negative latency" training where the model observes EMG
@@ -551,26 +551,63 @@ class NegativeLatencyWindowedEMGDataset(WindowedEMGDataset):
     time T + label_offset.
 
     Args:
+        hdf5_path (str): Path to the session file in hdf5 format.
         label_offset (float): Amount of time (in seconds) to shift the label
             window relative to the EMG window.
             - `> 0`: model predicts future keystrokes (negative-latency)
             - `< 0`: model predicts past keystrokes using future EMG
             (default: 0.0)
+        window_length (int): Size of each window. Specify None for no windowing
+            in which case this will be a dataset of length 1 containing the
+            entire session. (default: ``None``)
+        stride (int): Stride between consecutive windows. Specify None to set
+            this to window_length, in which case there will be no overlap
+            between consecutive windows. (default: ``window_length``)
+        padding (tuple[int, int]): Left and right contextual padding for
+            windows in terms of number of raw EMG samples.
+        jitter (bool): If True, randomly jitter the offset of each window.
+            Use this for training time variability. (default: ``False``)
+        transform (Callable): A composed sequence of transforms that takes
+            a window/slice of `EMGSessionData` in the form of a numpy
+            structured array and returns a `torch.Tensor` instance.
+            (default: ``emg2qwerty.transforms.ToTensor()``)
     """
 
-    label_offset: float = 0.0
+    hdf5_path: Path
+    label_offset: InitVar[float | None] = 0.0
+    window_length: InitVar[int | None] = None
+    stride: InitVar[int | None] = None
+    padding: InitVar[tuple[int, int]] = (0, 0)
+    jitter: bool = False
+    transform: Transform[np.ndarray, torch.Tensor] = field(default_factory=ToTensor)
 
     def __post_init__(
         self,
+        label_offset: float | None,
         window_length: int | None,
         stride: int | None,
         padding: tuple[int, int],
     ) -> None:
-        super().__post_init__(
-            window_length=window_length,
-            stride=stride,
-            padding=padding,
+        with EMGSessionData(self.hdf5_path) as session:
+            assert (
+                session.condition == "on_keyboard"
+            ), f"Unsupported condition {self.session.condition}"
+            self.session_length = len(session)
+
+        self.label_offset = (
+            label_offset if label_offset is not None else self.label_offset
         )
+        self.window_length = (
+            window_length if window_length is not None else self.session_length
+        )
+        self.stride = stride if stride is not None else self.window_length
+        assert self.window_length > 0 and self.stride > 0
+
+        (self.left_padding, self.right_padding) = padding
+        assert self.left_padding >= 0 and self.right_padding >= 0
+
+    def __len__(self) -> int:
+        return int(max(self.session_length - self.window_length, 0) // self.stride + 1)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         # Copy of WindowedEMGDataset.__getitem__ but shift the target label
@@ -605,3 +642,36 @@ class NegativeLatencyWindowedEMGDataset(WindowedEMGDataset):
         labels = torch.as_tensor(label_data.labels)
 
         return emg, labels
+    
+    @staticmethod
+    def collate(
+        samples: Sequence[tuple[torch.Tensor, torch.Tensor]]
+    ) -> dict[str, torch.Tensor]:
+        """Collates a list of samples into a padded batch of inputs and targets.
+        Each input sample in the list should be a tuple of (input, target) tensors.
+        Also returns the lengths of unpadded inputs and targets for use in loss
+        functions such as CTC or RNN-T.
+
+        Follows time-first format. That is, the retured batch is of shape (T, N, ...).
+        """
+        inputs = [sample[0] for sample in samples]  # [(T, ...)]
+        targets = [sample[1] for sample in samples]  # [(T,)]
+
+        # Batch of inputs and targets padded along time
+        input_batch = nn.utils.rnn.pad_sequence(inputs)  # (T, N, ...)
+        target_batch = nn.utils.rnn.pad_sequence(targets)  # (T, N)
+
+        # Lengths of unpadded input and target sequences for each batch entry
+        input_lengths = torch.as_tensor(
+            [len(_input) for _input in inputs], dtype=torch.int32
+        )
+        target_lengths = torch.as_tensor(
+            [len(target) for target in targets], dtype=torch.int32
+        )
+
+        return {
+            "inputs": input_batch,
+            "targets": target_batch,
+            "input_lengths": input_lengths,
+            "target_lengths": target_lengths,
+        }

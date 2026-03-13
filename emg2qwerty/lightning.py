@@ -21,7 +21,10 @@ from scipy.signal import butter
 
 from emg2qwerty import utils
 from emg2qwerty.charset import charset
-from emg2qwerty.data import LabelData, WindowedEMGDataset
+from emg2qwerty.data import (
+    LabelData, 
+    WindowedEMGDataset, 
+    NegativeLatencyWindowedEMGDataset)
 from emg2qwerty.metrics import CharacterErrorRates
 from emg2qwerty.modules import (
     MultiBandRotationInvariantMLP,
@@ -139,6 +142,118 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             collate_fn=WindowedEMGDataset.collate,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+
+class NegativeLatencyWindowedEMGDataModule(pl.LightningDataModule):
+    def __init__(
+        self,
+        label_offset: float,
+        window_length: int,
+        padding: tuple[int, int],
+        batch_size: int,
+        num_workers: int,
+        train_sessions: Sequence[Path],
+        val_sessions: Sequence[Path],
+        test_sessions: Sequence[Path],
+        train_transform: Transform[np.ndarray, torch.Tensor],
+        val_transform: Transform[np.ndarray, torch.Tensor],
+        test_transform: Transform[np.ndarray, torch.Tensor],
+    ) -> None:
+        super().__init__()
+
+        self.label_offset = label_offset
+        self.window_length = window_length
+        self.padding = padding
+
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+        self.train_sessions = train_sessions
+        self.val_sessions = val_sessions
+        self.test_sessions = test_sessions
+
+        self.train_transform = train_transform
+        self.val_transform = val_transform
+        self.test_transform = test_transform
+
+    def setup(self, stage: str | None = None) -> None:
+        self.train_dataset = ConcatDataset(
+            [
+                NegativeLatencyWindowedEMGDataset(
+                    hdf5_path,
+                    label_offset=self.label_offset,
+                    transform=self.train_transform,
+                    window_length=self.window_length,
+                    padding=self.padding,
+                    jitter=True,
+                )
+                for hdf5_path in self.train_sessions
+            ]
+        )
+        self.val_dataset = ConcatDataset(
+            [
+                NegativeLatencyWindowedEMGDataset(
+                    hdf5_path,
+                    label_offset=self.label_offset,
+                    transform=self.val_transform,
+                    window_length=self.window_length,
+                    padding=self.padding,
+                    jitter=False,
+                )
+                for hdf5_path in self.val_sessions
+            ]
+        )
+        self.test_dataset = ConcatDataset(
+            [
+                NegativeLatencyWindowedEMGDataset(
+                    hdf5_path,
+                    label_offset=self.label_offset,
+                    transform=self.test_transform,
+                    # Feed the entire session at once without windowing/padding
+                    # at test time for more realism
+                    window_length=None,
+                    padding=(0, 0),
+                    jitter=False,
+                )
+                for hdf5_path in self.test_sessions
+            ]
+        )
+
+    def train_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            collate_fn=NegativeLatencyWindowedEMGDataset.collate,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            collate_fn=NegativeLatencyWindowedEMGDataset.collate,
+            pin_memory=True,
+            persistent_workers=True,
+        )
+
+    def test_dataloader(self) -> DataLoader:
+        # Test dataset does not involve windowing and entire sessions are
+        # fed at once. Limit batch size to 1 to fit within GPU memory and
+        # avoid any influence of padding (while collating multiple batch items)
+        # in test scores.
+        return DataLoader(
+            self.test_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=self.num_workers,
+            collate_fn=NegativeLatencyWindowedEMGDataset.collate,
             pin_memory=True,
             persistent_workers=True,
         )

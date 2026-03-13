@@ -8,6 +8,7 @@ The following modifications were made to the baseline code to implement the vari
 - Added a LogMelSpectrogram class to transforms.py to implement conversion of spectrograms to the Mel scale as a pre-processing technique.
 - Added configuration files to orchestrate training of all models. Model configuration files are found under config/model, data pre-processing configuration files are found under config/transforms, and all training configurations are found under the top level config/ directory.
 - Added jupyter notebooks to facilitate model training under the training_notebooks/ directory. It is worth noting that these notebooks anticipate the virtual environment is already activated, and anticipate my local file structure. As such, these will require modification to run on any other file system.
+- Added a NegativeLatencyWindowedEMGDataModule and egativeLatencyWindowedEMGDataset to lightning.py and data.py, respectively, for testing the impacts of offsetting the label window to test feasibility of negative latency predictions.
 
 #
 # C147/247 Final Project
