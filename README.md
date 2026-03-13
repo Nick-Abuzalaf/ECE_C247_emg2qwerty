@@ -1,4 +1,17 @@
+
+# Overview of Changes
+
+The following modifications were made to the baseline code to implement the various architectures and data-processing techniques evaluated under this project:
+
+- Refactored lightning.py to facilitate easier model implementation using a CTCModule base class. This class retains all of the logic needed for model training and utilization, but abstracts the definition of the model. As such, each model is created by defining a new class that inherits from CTCModule and implementing a _model() function responsible for contructing the actual torch.nn.Sequential() model architecture.
+- Added modules to modules.py to support the various architectures, including RNNEncoder, LSTMEncoder, GRUEncoder, and TransformerEncoder. A FilterBank module was also defined in an attempt to implement a learnable band-pass filter on the spectrogram input, though this was not used as part of the selected models for the final report.
+- Added a LogMelSpectrogram class to transforms.py to implement conversion of spectrograms to the Mel scale as a pre-processing technique.
+- Added configuration files to orchestrate training of all models. Model configuration files are found under config/model, data pre-processing configuration files are found under config/transforms, and all training configurations are found under the top level config/ directory.
+- Added jupyter notebooks to facilitate model training under the training_notebooks/ directory. It is worth noting that these notebooks anticipate the virtual environment is already activated, and anticipate my local file structure. As such, these will require modification to run on any other file system.
+
+#
 # C147/247 Final Project
+
 ### Winter 2026 
 
 This course project is built upon the emg2qwerty work from Meta. The first section of this README provides some guidance for working with the repo and contains a running list of FAQs. **Note that the rest of the README is from the original repo and we encourage you to take a look at their work.**
