@@ -188,6 +188,56 @@ class LogSpectrogram:
         logspec = torch.log10(spec + 1e-6)  # (..., C, freq, T)
         return logspec.movedim(-1, 0)  # (T, ..., C, freq)
 
+@dataclass
+class LogMelSpectrogram:
+    """Creates a log10-scaled mel spectrogram from an EMG signal. In the case of
+    multi-channeled signal, the channels are treated independently.
+    The input must be of shape (T, ...) and the returned spectrogram
+    is of shape (T, ..., freq).
+
+    Args:
+        n_fft (int): FFT size. Produces n_fft // 2 + 1 STFT bins.
+            (default: 64)
+        hop_length (int): Stride between STFT windows.
+            (default: 16)
+        sample_rate (int): Sampling rate of signal. (default: 2000)
+        n_mels (int): Number of mel frequency bins.
+            (default: 16)
+        f_min (float): Minimum frequency for mel filters.
+            (default: 20.0)
+        f_max (float): Maximum frequency for mel filters.
+            (default: 500.0)
+    """
+
+    n_fft: int = 64
+    hop_length: int = 16
+    sample_rate: int = 2000
+    n_mels: int = 16
+    f_min: float = 0.0
+    f_max: float = 1000.0
+
+    def __post_init__(self) -> None:
+        self.spectrogram = torchaudio.transforms.Spectrogram(
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            normalized=True,
+            center=False,
+        )
+
+        self.mel_scale = torchaudio.transforms.MelScale(
+            n_mels=self.n_mels,
+            sample_rate=self.sample_rate,
+            f_min=self.f_min,
+            f_max=self.f_max,
+            n_stft=self.n_fft // 2 + 1,
+        )
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        x = tensor.movedim(0, -1)        # (T, ..., C) -> (..., C, T)
+        spec = self.spectrogram(x)       # (..., C, freq, T)
+        mel = self.mel_scale(spec)       # (..., C, n_mels, T)
+        logmel = torch.log10(mel + 1e-6) # (..., C, n_mels, T)
+        return logmel.movedim(-1, 0)     # (T, ..., C, n_mels)
 
 @dataclass
 class SpecAugment:

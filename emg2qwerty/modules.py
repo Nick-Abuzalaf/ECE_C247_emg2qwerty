@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections.abc import Sequence
+import math
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -96,7 +98,8 @@ class RotationInvariantMLP(nn.Module):
         # corresponding to the original tensor with its electrode channels
         # shifted by one of ``offsets``:
         # (T, N, C, ...) -> (T, N, rotation, C, ...)
-        x = torch.stack([x.roll(offset, dims=2) for offset in self.offsets], dim=2)
+        x = torch.stack([x.roll(offset, dims=2) for offset in self.offsets], 
+                        dim=2)
 
         # Flatten features and pass through MLP:
         # (T, N, rotation, C, ...) -> (T, N, rotation, mlp_features[-1])
@@ -270,7 +273,10 @@ class TDSConvEncoder(nn.Module):
             ), "block_channels must evenly divide num_features"
             tds_conv_blocks.extend(
                 [
-                    TDSConv2dBlock(channels, num_features // channels, kernel_width),
+                    TDSConv2dBlock(
+                        channels, 
+                        num_features // channels, 
+                        kernel_width),
                     TDSFullyConnectedBlock(num_features),
                 ]
             )
@@ -278,3 +284,478 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+class RNNEncoder(nn.Module):
+    """An RNN encoder.
+
+    Args:
+        num_features (int): ``num_features`` for an input of shape
+            (T, N, num_features).
+        hidden_size (int): The hidden size of the RNN layer.
+        num_layers (int): The number of layers in the RNN.
+        dropout (float): The dropout probability for the RNN. Only applied if
+            `num_layers` > 1. (default: 0.1)
+        bidirectional (bool): Whether to use a bidirectional RNN. (default:
+            False)
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        hidden_size: int,
+        num_layers: int,
+        dropout: float = 0.1,
+        bidirectional: bool = False,
+    ) -> None:
+        super().__init__()
+
+        self.rnn = nn.RNN(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
+        )
+
+        out_features = hidden_size * (2 if bidirectional else 1)
+        self.proj = nn.Linear(out_features, num_features)
+        self.layer_norm = nn.LayerNorm(num_features)
+    
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        x, _ = self.rnn(inputs)  # (T, N, hidden_size * num_directions)
+        x = self.proj(x)  # (T, N, num_features)
+        x = x + inputs  # Skip connection
+        return self.layer_norm(x)  # (T, N, num_features)
+
+class LSTMEncoder(nn.Module):
+    """An LSTM encoder.
+
+    Args:
+        num_features (int): ``num_features`` for an input of shape
+            (T, N, num_features).
+        hidden_size (int): The hidden size of the LSTM layer.
+        num_layers (int): The number of layers in the LSTM.
+        dropout (float): The dropout probability for the LSTM. Only applied if
+            `num_layers` > 1. (default: 0.1)
+        bidirectional (bool): Whether to use a bidirectional LSTM. (default:
+            False)
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        hidden_size: int,
+        num_layers: int,
+        dropout: float = 0.1,
+        bidirectional: bool = False,
+    ) -> None:
+        super().__init__()
+
+        self.lstm = nn.LSTM(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
+        )
+
+        out_features = hidden_size * (2 if bidirectional else 1)
+        self.proj = nn.Linear(out_features, num_features)
+        self.layer_norm = nn.LayerNorm(num_features)
+    
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        x, _ = self.lstm(inputs)  # (T, N, hidden_size * num_directions)
+        x = self.proj(x)  # (T, N, num_features)
+        x = x + inputs  # Skip connection
+        return self.layer_norm(x)  # (T, N, num_features)
+
+class GRUEncoder(nn.Module):
+    """A GRU encoder.
+
+    Args:
+        num_features (int): ``num_features`` for an input of shape
+            (T, N, num_features).
+        hidden_size (int): The hidden size of the GRU layer.
+        num_layers (int): The number of layers in the GRU.
+        dropout (float): The dropout probability for the GRU. Only applied if
+            `num_layers` > 1. (default: 0.1)
+        bidirectional (bool): Whether to use a bidirectional GRU. (default:
+            False)
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        hidden_size: int,
+        num_layers: int,
+        dropout: float = 0.1,
+        bidirectional: bool = False,
+    ) -> None:
+        super().__init__()
+
+        self.gru = nn.GRU(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
+        )
+
+        out_features = hidden_size * (2 if bidirectional else 1)
+        self.proj = nn.Linear(out_features, num_features)
+        self.layer_norm = nn.LayerNorm(num_features)
+    
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        x, _ = self.gru(inputs)  # (T, N, hidden_size * num_directions)
+        x = self.proj(x)  # (T, N, num_features)
+        x = x + inputs  # Skip connection
+        return self.layer_norm(x)  # (T, N, num_features)
+
+# class PositionalEncoding(nn.Module):
+#     """A `torch.nn.Module` that adds sinusoidal positional encodings to an input
+#     tensor of shape (T, N, num_features) as per "Attention is All You Need"
+#     (https://arxiv.org/abs/1706.03762).
+
+#     Args:
+#         d_model (int): The number of expected features in the input (i.e., the
+#             last dimension of the input tensor).
+#         max_len (int): The maximum length of the input sequences. This
+#             determines the size of the positional encoding buffer. (default:
+#             5000)
+#     """
+
+#     def __init__(self, d_model: int, max_len: int = 5000):
+#         super().__init__()
+#         self.d_model = d_model
+
+#         pe = torch.zeros(max_len, d_model)
+#         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+#         div_term = torch.exp(
+#             torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+#         )
+#         pe[:, 0::2] = torch.sin(position * div_term)
+#         pe[:, 1::2] = torch.cos(position * div_term)
+#         self.register_buffer("pe", pe)  # (max_len, d_model)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         # Expect x shape: (T, N, D)
+#         if x.ndim != 3:
+#             raise ValueError(f"PositionalEncoding expects a 3D tensor (T,N,D), got {x.ndim}D")
+#         if x.size(2) != self.d_model:
+#             raise ValueError(
+#                 f"PositionalEncoding expected last dim {self.d_model}, got {x.size(2)}"
+#             )
+
+#         # Use a (T, 1, D) buffer so it broadcasts cleanly across batch dim (N)
+#         pe = self.pe[: x.size(0)].unsqueeze(1).to(x.dtype)
+#         return x + pe
+
+class TransformerEncoder(nn.Module):
+    """A Transformer encoder.
+
+    Args:
+        num_features (int): ``num_features`` for an input of shape
+            (T, N, num_features).
+        num_heads (int): The number of attention heads in the Transformer.
+        num_layers (int): The number of layers in the Transformer.
+        dropout (float): The dropout probability for the Transformer. (default:
+            0.1)
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        self.input_proj = nn.Linear(num_features, d_model)
+        self.input_norm = nn.LayerNorm(d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dropout=dropout,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=encoder_layer,
+            num_layers=num_layers,
+        )
+
+        self.layer_norm = nn.LayerNorm(d_model)
+    
+    def position_encoding(self, inputs) -> torch.Tensor:
+        num_features = inputs.shape[2]
+        length = inputs.shape[0]
+
+        pe = torch.zeros(length, num_features)
+        position = torch.arange(0, length, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, num_features, 2).float() * 
+            (-math.log(10000.0) / num_features)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        return pe
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Forward pass with residual shortcut around the encoder.
+        """
+        # Project each (T, num_features) slice to (T, d_model) and normalize prior to encoding.
+        x = self.input_proj(inputs)
+        x = self.input_norm(x)
+
+        pe = self.position_encoding(x).unsqueeze(1).to(x.device)  # (T, 1, d_model)
+        x = x + pe
+
+        out = self.transformer_encoder(x)  # (T, N, d_model)
+        out = out + x
+
+        return self.layer_norm(out)  # (T, N, d_model)
+
+# class EMGFilter(nn.Module):
+#     """A `torch.nn.Module` that applies a bandpass FIR filter to EMG signals
+#     using depthwise convolution. For an input of shape (T, N, C), the convolution is applied independently over each of the C channels."""
+
+#     def __init__(
+#             self, 
+#             lowcut, 
+#             highcut, 
+#             fs, 
+#             channels, 
+#             taps=401):
+#         super().__init__()
+
+#         kernel = self.design_fir_bandpass(lowcut, highcut, fs, taps)
+#         kernel = kernel.view(1, 1, taps).repeat(channels, 1, 1)  # (channels, 1, taps)
+
+#         self.conv = nn.Conv1d(
+#             in_channels=channels,
+#             out_channels=channels,
+#             kernel_size=taps,
+#             padding=taps // 2,
+#             groups=channels,  # depthwise convolution
+#             bias=False,
+#         )
+
+#         with torch.no_grad():
+#             self.conv.weight[:] = kernel
+
+#     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+#         # TNC -> NCT -> NfT -> NfT (after conv) -> NCT -> TNC
+#         x = inputs.movedim(0, 1).movedim(2, 1)  # TNC -> NCT -> NfT
+#         x = self.conv(x)  # NfT -> NfT
+#         x = x.movedim(2, 1).movedim(1, 0)  # NfT -> NCT -> TNC
+#         return x
+
+#     def design_fir_bandpass(self, lowcut, highcut, fs, numtaps, device="cpu"):
+#         nyq = 0.5 * fs
+#         low = lowcut / nyq
+#         high = highcut / nyq
+        
+#         n = np.arange(numtaps)
+#         center = (numtaps - 1) / 2
+
+#         def sinc(x):
+#             return np.sinc(x)
+        
+#         h = (2 * high * sinc(2 * high * (n - center)) - 2 * low * sinc(2 * low * (n - center)))
+#         window = np.hamming(numtaps)
+        
+#         h *= window
+#         h /= np.sum(h)
+#         h = torch.tensor(h, dtype=torch.float32, device=device)
+        
+#         return h
+    
+# class EMGFilter(nn.Module):
+#     """A `torch.nn.Module` that applies a bandpass FIR filter to EMG signals
+#     using depthwise convolution. For an input of shape (T, N, B, C), the
+#     convolution is applied independently over each of the B*C channels."""
+
+#     def __init__(
+#         self,
+#         lowcut,
+#         highcut,
+#         fs,
+#         channels,
+#         bands: int = 1,
+#         taps: int = 401,
+#     ):
+#         super().__init__()
+
+#         self.bands = bands
+#         self.channels = channels
+#         total_channels = bands * channels
+
+#         kernel = self.design_fir_bandpass(lowcut, highcut, fs, taps)
+#         kernel = kernel.view(1, 1, taps).repeat(total_channels, 1, 1)
+
+#         self.conv = nn.Conv1d(
+#             in_channels=total_channels,
+#             out_channels=total_channels,
+#             kernel_size=taps,
+#             padding=taps // 2,
+#             groups=total_channels,
+#             bias=False,
+#         )
+
+#         with torch.no_grad():
+#             self.conv.weight[:] = kernel
+
+#     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+#         # Expect (T, N, B, C)
+#         T, N, B, C = inputs.shape
+#         assert B == self.bands and C == self.channels
+
+#         #   -> (N, B, C, T) -> (N, B*C, T)
+#         x = inputs.permute(1, 2, 3, 0).reshape(N, B * C, T)
+
+#         x = self.conv(x)  # (N, B*C, T)
+
+#         # (N, B*C, T) -> (N, B, C, T) -> (T, N, B, C)
+#         x = x.reshape(N, B, C, T).permute(3, 0, 1, 2)
+#         assert x.shape == inputs.shape
+        
+#         return x
+
+#     def design_fir_bandpass(self, lowcut, highcut, fs, numtaps, device="cpu"):
+#         nyq = 0.5 * fs
+#         low = lowcut / nyq
+#         high = highcut / nyq
+        
+#         n = np.arange(numtaps)
+#         center = (numtaps - 1) / 2
+
+#         def sinc(x):
+#             return np.sinc(x)
+        
+#         h = (2 * high * sinc(2 * high * (n - center)) - 2 * low * sinc(2 * low * (n - center)))
+#         window = np.hamming(numtaps)
+        
+#         h *= window
+#         h /= np.sum(h)
+#         h = torch.tensor(h, dtype=torch.float32, device=device)
+        
+#         return h
+    
+# class Biquad(nn.Module):
+#     def __init__(self):
+#         super().__init__()
+
+#         # learnable coefficients
+#         self.b = nn.Parameter(torch.tensor([1.0, 0.0, 0.0]))
+#         self.a = nn.Parameter(torch.tensor([0.0, 0.0]))
+
+#     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+#         # Expect (T, N, B, C)
+#         if inputs.ndim != 4:
+#             raise ValueError(f"Biquad.forward expects a 4D tensor (T, N, B, C), got {inputs.ndim}D")
+
+#         T, N, B, C = inputs.shape
+
+#         # Process each time series independently by collapsing batch/bands/channels.
+#         x = inputs.permute(1, 2, 3, 0).reshape(N * B * C, T)
+#         y = torch.zeros_like(x)
+
+#         x1 = torch.zeros(N * B * C, device=inputs.device)
+#         x2 = torch.zeros(N * B * C, device=inputs.device)
+
+#         y1 = torch.zeros(N * B * C, device=inputs.device)
+#         y2 = torch.zeros(N * B * C, device=inputs.device)
+
+#         b0, b1, b2 = self.b
+#         a1, a2 = self.a
+
+#         a1_tanh = torch.tanh(a1)
+#         a2_tanh = torch.tanh(a2)
+
+#         for t in range(T):
+#             xt = x[:, t]
+
+#             yt = (
+#                 b0 * xt
+#                 + b1 * x1
+#                 + b2 * x2
+#                 - a1_tanh * y1
+#                 - a2_tanh * y2
+#             )
+
+#             y[:, t] = yt
+
+#             x2 = x1
+#             x1 = xt
+
+#             y2 = y1
+#             y1 = yt
+
+#         # Restore original (T, N, B, C) shape
+#         y = y.view(N, B, C, T).permute(3, 0, 1, 2)
+#         return y
+    
+# class ButterWorthLayer(nn.Module):
+#     def __init__(self):
+#         super().__init__()
+
+#         self.section1 = Biquad()
+#         self.section2 = Biquad()
+
+#     def forward(self, x):
+
+#         x = self.section1(x)
+#         x = self.section2(x)
+
+#         return x
+
+class FilterBank(nn.Module):
+
+    def __init__(self, channels, num_freq_bins, num_bands=2):
+        super().__init__()
+
+        self.num_freq_bins = num_freq_bins
+        self.channels = channels
+        self.num_bands = num_bands
+
+        # learnable cutoffs
+        self.low = nn.Parameter(torch.rand(channels, num_bands) * 0.4)
+        self.high = nn.Parameter(torch.rand(channels, num_bands) * 0.6 + 0.4)
+
+        self.sharpness = 40
+
+    def forward(self, x):
+        # x: (T,N,B,C,F)
+        device = x.device
+
+        freqs = torch.linspace(
+            start=0, 
+            end=1, 
+            steps=self.num_freq_bins,
+            device=device
+        )
+
+        outputs = []
+
+        # Apply a separate learned bandpass filter for each input band.
+        for b in range(self.num_bands):
+            # Select band b: (T, N, C, F)
+            x_b = x[:, :, b, :, :]
+
+            low = torch.sigmoid(self.low[:, b]).unsqueeze(-1)
+            high = torch.sigmoid(self.high[:, b]).unsqueeze(-1)
+
+            mask = (
+                torch.sigmoid(self.sharpness * (freqs - low))
+                - torch.sigmoid(self.sharpness * (freqs - high))
+            )
+
+            # mask shape: (1, 1, C, F) to broadcast over (T, N, C, F)
+            mask = mask.unsqueeze(0).unsqueeze(0)
+
+            outputs.append(x_b * mask)
+
+        # Reassemble bands: (T, N, B, C, F)
+        return torch.stack(outputs, dim=2)

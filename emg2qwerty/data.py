@@ -541,3 +541,67 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
             "input_lengths": input_lengths,
             "target_lengths": target_lengths,
         }
+
+
+class NegativeLatencyWindowedEMGDataset(WindowedEMGDataset):
+    """A `WindowedEMGDataset` that shifts target labels forward in time.
+
+    This enables "negative latency" training where the model observes EMG
+    signals up to time T but is trained to predict keystrokes that occur at
+    time T + label_offset.
+
+    Args:
+        label_offset (float): Amount of time (in seconds) to shift the label
+            window relative to the EMG window.
+            - `> 0`: model predicts future keystrokes (negative-latency)
+            - `< 0`: model predicts past keystrokes using future EMG
+            (default: 0.0)
+    """
+
+    label_offset: float = 0.0
+
+    def __post_init__(
+        self,
+        window_length: int | None,
+        stride: int | None,
+        padding: tuple[int, int],
+    ) -> None:
+        super().__post_init__(
+            window_length=window_length,
+            stride=stride,
+            padding=padding,
+        )
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        # Copy of WindowedEMGDataset.__getitem__ but shift the target label
+        # window by `label_offset`.
+        if not hasattr(self, "session"):
+            self.session = EMGSessionData(self.hdf5_path)
+
+        offset = idx * self.stride
+
+        # Randomly jitter the window offset.
+        leftover = len(self.session) - (offset + self.window_length)
+        if leftover < 0:
+            raise IndexError(f"Index {idx} out of bounds")
+        if leftover > 0 and self.jitter:
+            offset += np.random.randint(0, min(self.stride, leftover))
+
+        # Expand window to include contextual padding and fetch.
+        window_start = max(offset - self.left_padding, 0)
+        window_end = offset + self.window_length + self.right_padding
+        window = self.session[window_start:window_end]
+
+        # Extract EMG tensor corresponding to the window.
+        emg = self.transform(window)
+        assert torch.is_tensor(emg)
+
+        # Extract labels corresponding to the original (un-padded) window,
+        # shifted by label_offset.
+        timestamps = window[EMGSessionData.TIMESTAMPS]
+        start_t = timestamps[offset - window_start] + self.label_offset
+        end_t = timestamps[(offset + self.window_length - 1) - window_start] + self.label_offset
+        label_data = self.session.ground_truth(start_t, end_t)
+        labels = torch.as_tensor(label_data.labels)
+
+        return emg, labels

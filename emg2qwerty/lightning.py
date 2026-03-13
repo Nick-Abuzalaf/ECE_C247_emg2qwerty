@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from abc import abstractmethod
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, ClassVar
@@ -16,6 +17,7 @@ from omegaconf import DictConfig
 from torch import nn
 from torch.utils.data import ConcatDataset, DataLoader
 from torchmetrics import MetricCollection
+from scipy.signal import butter
 
 from emg2qwerty import utils
 from emg2qwerty.charset import charset
@@ -25,6 +27,11 @@ from emg2qwerty.modules import (
     MultiBandRotationInvariantMLP,
     SpectrogramNorm,
     TDSConvEncoder,
+    RNNEncoder,
+    LSTMEncoder,
+    GRUEncoder,
+    TransformerEncoder,
+    FilterBank
 )
 from emg2qwerty.transforms import Transform
 
@@ -136,48 +143,17 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             persistent_workers=True,
         )
 
-
-class TDSConvCTCModule(pl.LightningModule):
-    NUM_BANDS: ClassVar[int] = 2
-    ELECTRODE_CHANNELS: ClassVar[int] = 16
+class CTCModule(pl.LightningModule):
+    """Abstact module for CTC-based training of emg2qwerty models."""
 
     def __init__(
         self,
-        in_features: int,
-        mlp_features: Sequence[int],
-        block_channels: Sequence[int],
-        kernel_width: int,
         optimizer: DictConfig,
         lr_scheduler: DictConfig,
         decoder: DictConfig,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
-
-        num_features = self.NUM_BANDS * mlp_features[-1]
-
-        # Model
-        # inputs: (T, N, bands=2, electrode_channels=16, freq)
-        self.model = nn.Sequential(
-            # (T, N, bands=2, C=16, freq)
-            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
-            # (T, N, bands=2, mlp_features[-1])
-            MultiBandRotationInvariantMLP(
-                in_features=in_features,
-                mlp_features=mlp_features,
-                num_bands=self.NUM_BANDS,
-            ),
-            # (T, N, num_features)
-            nn.Flatten(start_dim=2),
-            TDSConvEncoder(
-                num_features=num_features,
-                block_channels=block_channels,
-                kernel_width=kernel_width,
-            ),
-            # (T, N, num_classes)
-            nn.Linear(num_features, charset().num_classes),
-            nn.LogSoftmax(dim=-1),
-        )
 
         # Criterion
         self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
@@ -196,6 +172,11 @@ class TDSConvCTCModule(pl.LightningModule):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.model(inputs)
+
+    @abstractmethod
+    def _model(self) -> None:
+        """To be implemented by subclasses to instantiate the model architecture and assign it to `self.model`."""
+        pass
 
     def _step(
         self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
@@ -268,4 +249,1082 @@ class TDSConvCTCModule(pl.LightningModule):
             self.parameters(),
             optimizer_config=self.hparams.optimizer,
             lr_scheduler_config=self.hparams.lr_scheduler,
+        )
+
+class TDSConvCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width
+        )
+
+    def _model(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            TDSConvEncoder(
+                num_features=num_features,
+                block_channels=block_channels,
+                kernel_width=kernel_width,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+class FilterTDSConvCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        num_freq_bins: int,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            num_freq_bins=num_freq_bins,
+            in_features=in_features,
+            mlp_features=mlp_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width
+        )
+
+    def _model(
+        self,
+        num_freq_bins: int,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            FilterBank(
+                channels=self.ELECTRODE_CHANNELS,
+                num_freq_bins=num_freq_bins,
+                num_bands=self.NUM_BANDS,
+            ),
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            TDSConvEncoder(
+                num_features=num_features,
+                block_channels=block_channels,
+                kernel_width=kernel_width,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+class RNNCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        hidden_size: int,
+        num_layers: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        dropout: float = 0.1,
+        bidirectional: bool = True,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional,
+        )
+
+    def _model(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        bidirectional: bool,
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+        
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            RNNEncoder(
+                num_features=num_features,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout,
+                bidirectional=bidirectional,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+class ConvRNNCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        hidden_size: int,
+        num_layers: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        dropout: float = 0.1,
+        bidirectional: bool = True,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional,
+        )
+
+    def _model(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        bidirectional: bool,
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            TDSConvEncoder(
+                num_features=num_features,
+                block_channels=block_channels,
+                kernel_width=kernel_width,
+            ),
+            RNNEncoder(
+                num_features=num_features,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout,
+                bidirectional=bidirectional,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+class FilterConvRNNCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        num_freq_bins: int,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        hidden_size: int,
+        num_layers: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        dropout: float = 0.1,
+        bidirectional: bool = True,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            num_freq_bins=num_freq_bins,
+            in_features=in_features,
+            mlp_features=mlp_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional,
+        )
+
+    def _model(
+        self,
+        num_freq_bins: int,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        bidirectional: bool,
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            FilterBank(
+                channels=self.ELECTRODE_CHANNELS,
+                num_freq_bins=num_freq_bins,
+                num_bands=self.NUM_BANDS,
+            ),
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            TDSConvEncoder(
+                num_features=num_features,
+                block_channels=block_channels,
+                kernel_width=kernel_width,
+            ),
+            RNNEncoder(
+                num_features=num_features,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout,
+                bidirectional=bidirectional,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+class LSTMCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        hidden_size: int,
+        num_layers: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        dropout: float = 0.1,
+        bidirectional: bool = True,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional,
+        )
+
+    def _model(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        bidirectional: bool,
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+        
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            LSTMEncoder(
+                num_features=num_features,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout,
+                bidirectional=bidirectional,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+class ConvLSTMCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        hidden_size: int,
+        num_layers: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        dropout: float = 0.1,
+        bidirectional: bool = True,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional,
+        )
+
+    def _model(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        bidirectional: bool,
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            TDSConvEncoder(
+                num_features=num_features,
+                block_channels=block_channels,
+                kernel_width=kernel_width,
+            ),
+            LSTMEncoder(
+                num_features=num_features,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout,
+                bidirectional=bidirectional,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+class FilterConvLSTMCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        num_freq_bins: int,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        hidden_size: int,
+        num_layers: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        dropout: float = 0.1,
+        bidirectional: bool = True,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            num_freq_bins=num_freq_bins,
+            in_features=in_features,
+            mlp_features=mlp_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional,
+        )
+
+    def _model(
+        self,
+        num_freq_bins: int,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        bidirectional: bool,
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            FilterBank(
+                channels=self.ELECTRODE_CHANNELS,
+                num_freq_bins=num_freq_bins,
+                num_bands=self.NUM_BANDS,
+            ),
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            TDSConvEncoder(
+                num_features=num_features,
+                block_channels=block_channels,
+                kernel_width=kernel_width,
+            ),
+            LSTMEncoder(
+                num_features=num_features,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout,
+                bidirectional=bidirectional,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+class GRUCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        hidden_size: int,
+        num_layers: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        dropout: float = 0.1,
+        bidirectional: bool = True,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional,
+        )
+
+    def _model(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        bidirectional: bool,
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+        
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            GRUEncoder(
+                num_features=num_features,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout,
+                bidirectional=bidirectional,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+class ConvGRUCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        hidden_size: int,
+        num_layers: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        dropout: float = 0.1,
+        bidirectional: bool = True,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional,
+        )
+
+    def _model(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        bidirectional: bool,
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            TDSConvEncoder(
+                num_features=num_features,
+                block_channels=block_channels,
+                kernel_width=kernel_width,
+            ),
+            GRUEncoder(
+                num_features=num_features,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout,
+                bidirectional=bidirectional,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+class FilterConvGRUCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        num_freq_bins: int,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        hidden_size: int,
+        num_layers: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        dropout: float = 0.1,
+        bidirectional: bool = True,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            num_freq_bins=num_freq_bins,
+            in_features=in_features,
+            mlp_features=mlp_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional,
+        )
+
+    def _model(
+        self,
+        num_freq_bins: int,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        hidden_size: int,
+        num_layers: int,
+        dropout: float,
+        bidirectional: bool,
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            FilterBank(
+                channels=self.ELECTRODE_CHANNELS,
+                num_freq_bins=num_freq_bins,
+                num_bands=self.NUM_BANDS,
+            ),
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            TDSConvEncoder(
+                num_features=num_features,
+                block_channels=block_channels,
+                kernel_width=kernel_width,
+            ),
+            GRUEncoder(
+                num_features=num_features,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout,
+                bidirectional=bidirectional,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+class TransformerCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            d_model=d_model,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+
+    def _model(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        dropout: float,
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+        
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            TransformerEncoder(
+                num_features=num_features,
+                d_model=d_model,
+                num_heads=num_heads,
+                num_layers=num_layers,
+                dropout=dropout,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(d_model, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+class ConvTransformerCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width,
+            d_model=d_model,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+
+    def _model(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        dropout: float,
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            TDSConvEncoder(
+                num_features=num_features,
+                block_channels=block_channels,
+                kernel_width=kernel_width,
+            ),
+            TransformerEncoder(
+                num_features=num_features,
+                d_model=d_model,
+                num_heads=num_heads,
+                num_layers=num_layers,
+                dropout=dropout,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(d_model, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+class FilterConvTransformerCTCModule(CTCModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        num_freq_bins: int,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__(
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            decoder=decoder,
+        )
+
+        self._model(
+            num_freq_bins=num_freq_bins,
+            in_features=in_features,
+            mlp_features=mlp_features,
+            block_channels=block_channels,
+            kernel_width=kernel_width,
+            d_model=d_model,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+
+    def _model(
+        self,
+        num_freq_bins: int,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        dropout: float,
+    ) -> nn.Sequential:
+        num_features = self.NUM_BANDS * mlp_features[-1]
+
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.model = nn.Sequential(
+            # (T, N, bands=2, C=16, freq)
+            FilterBank(
+                channels=self.ELECTRODE_CHANNELS,
+                num_freq_bins=num_freq_bins,
+                num_bands=self.NUM_BANDS,
+            ),
+            SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
+            
+            # (T, N, bands=2, mlp_features[-1])
+            MultiBandRotationInvariantMLP(
+                in_features=in_features,
+                mlp_features=mlp_features,
+                num_bands=self.NUM_BANDS,
+            ),
+            
+            # (T, N, num_features)
+            nn.Flatten(start_dim=2),
+            TDSConvEncoder(
+                num_features=num_features,
+                block_channels=block_channels,
+                kernel_width=kernel_width,
+            ),
+            TransformerEncoder(
+                num_features=num_features,
+                d_model=d_model,
+                num_heads=num_heads,
+                num_layers=num_layers,
+                dropout=dropout,
+            ),
+            
+            # (T, N, num_classes)
+            nn.Linear(d_model, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
         )
